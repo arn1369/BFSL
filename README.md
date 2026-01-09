@@ -90,7 +90,7 @@ The goal is to apply FSL in more domains, notably in medical predictions data.
 2) Diagonal in adjacency matrix is $-10^9$ (temporary solution with the Diffusion Matrix, try to test Normalized Laplacian ?)
 3) Maybe interesting to see $H²$, but at the price of interpretability -> dimensionality reduction ? what performance with $H²$ ? Are the links between assets sooo complex in real life ? Also complexity ($O(N^3)$) -> Using hypergraph to capture collective (sector) behavior -> Sheaf Hypergraph Networks (lighter than $H²$ computation)
 4) To solve complexity (another solution) :
-    Instead of learning a dense matrix $W_{ij}\in \mathbb{R}^{D\cdot D}$, learn two matrices on lower rank $U_{ij}\in \mathbb{R}^{D\cdot r}$ and $V_{ij}\in \R^{r*D}$ with $r<<D$ :
+    Instead of learning a dense matrix $W_{ij}\in \mathbb{R}^{D\cdot D}$, learn two matrices on lower rank $U_{ij}\in \mathbb{R}^{D\cdot r}$ and $V_{ij}\in \mathbb{R}^{r*D}$ with $r<<D$ :
     $$ W_{ij} \approx U_{ij}\cdot V_{ij}$$
     The complexity after this would therefore be $O(N^² \cdot 2D\cdot r)$, a considerable improvement ! But now we need to see the results.
 5) Olliver-Ricci curvature. Seen on a video, measures congestion. Need to dig that, would be interesting. Small explanation : in crisis, everyone rush on safe-assets (topological congestion). We could inject the curvature as a new feature in the HMM besides $H¹$ ?
