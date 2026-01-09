@@ -90,7 +90,7 @@ The goal is to apply FSL in more domains, notably in medical predictions data.
 2) Diagonal in adjacency matrix is $-10^9$ (temporary solution with the Diffusion Matrix, try to test Normalized Laplacian ?)
 3) Maybe interesting to see $H²$, but at the price of interpretability -> dimensionality reduction ? what performance with $H²$ ? Are the links between assets sooo complex in real life ? Also complexity ($O(N^3)$) -> Using hypergraph to capture collective (sector) behavior -> Sheaf Hypergraph Networks (lighter than $H²$ computation)
 4) To solve complexity (another solution) :
-    Instead of learning a dense matrix $W_{ij}\in \R^{D\cdot D}$, learn two matrices on lower rank $U_{ij}\in \R^{D\cdot r}$ and $V_{ij}\in \R^{r*D}$ with $r<<D$ :
+    Instead of learning a dense matrix $W_{ij}\in \mathbb{R}^{D\cdot D}$, learn two matrices on lower rank $U_{ij}\in \mathbb{R}^{D\cdot r}$ and $V_{ij}\in \R^{r*D}$ with $r<<D$ :
     $$ W_{ij} \approx U_{ij}\cdot V_{ij}$$
     The complexity after this would therefore be $O(N^² \cdot 2D\cdot r)$, a considerable improvement ! But now we need to see the results.
 5) Olliver-Ricci curvature. Seen on a video, measures congestion. Need to dig that, would be interesting. Small explanation : in crisis, everyone rush on safe-assets (topological congestion). We could inject the curvature as a new feature in the HMM besides $H¹$ ?
@@ -101,11 +101,11 @@ The goal is to apply FSL in more domains, notably in medical predictions data.
 
 ## Bibliography and notes
 
-A lot of work comes from the paper "Sheaf Cohomology of Linear Predictive Coding Networks" from Jeffrey Seely at Sakana AI (14 nov. 2025). My work is the implementation and some improvements of its work.
+A lot of work comes from the paper [Sheaf Cohomology of Linear Predictive Coding Networks](https://arxiv.org/pdf/2511.11092) from Jeffrey Seely at Sakana AI  (14 nov. 2025). My work is the implementation and some improvements of its work.
 Moreover, LLM were used to generate code. This helps to go faster in my research. I check what the LLM does, but my competences and checks are not perfect. Some errors may have slipped in there. I'm constantly improving the methods used, and fixing bugs.
 
 English is not my primary language, so feel free to correct any mistakes !
 
-Also, do not hesitate to make a P-R with new methods, comments, better approach, etc ! I'm open to any improvement of FSL :) Don't hesitate to contact me : <mailto:arnullens@gmail.com> to discuss or if you have any idea !
+Also, do not hesitate to make a P-R with new methods, comments, better approach, etc ! I'm open to any improvement of FSL :\) Don't hesitate to contact me : [arnullens@gmail.com](mailto:arnullens@gmail.com) to discuss or if you have any idea !
 
 Thank you for your interest in my project !
