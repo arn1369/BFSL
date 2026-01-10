@@ -447,11 +447,6 @@ class TopologicalTripletLoss(nn.Module):
                 h1_negative: torch.Tensor,
                 anchor_embedding: torch.Tensor = None,
                 positive_embedding: torch.Tensor = None) -> torch.Tensor:
-        """
-        h1_anchor : Score H1 de la fenêtre actuelle (doit être bas)
-        h1_positive : Score H1 d'une fenêtre proche ou augmentée (doit être bas et proche de anchor)
-        h1_negative : Score H1 d'une fenêtre bruitée/shufflée (doit être haut)
-        """
         
         # Structural Term: Minimize H1 for valid data (Anchor & Positive)
         structural_loss = h1_anchor + h1_positive
@@ -473,15 +468,15 @@ class MIMICPredictor(nn.Module):
     def __init__(self, n_assets, window_size):
         super().__init__()
         
-        #ANCHOR: Simple hierarchy -> probably need to change !!
+        #ANCHOR: Simple hierarchy, will probably change in the future
         self.fsl = HierarchicalFSL(
             scales=[n_assets, n_assets//2, 1], 
             context_dim=window_size,
             attention_dim=32,
-            diffusion_steps=[1, 2, 2] # Diffusion au niveau organes, puis au niveau global
+            diffusion_steps=[1, 2, 2]
         )
         
-        # Tête de prédiction (optionnelle pour la reconstruction mais requise par le code)
+        # Optional in BFSL but it's for compatibility with FSL structure
         self.head = nn.Sequential(
             nn.Linear(window_size, 32),
             nn.GELU(),

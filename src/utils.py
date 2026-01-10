@@ -5,14 +5,12 @@ from torch.utils.data import Dataset
 import os
 import time
 
-# Dictionnaire des IDs MIMIC-IV (Table chartevents)
-# Ce sont les "Tickers" du corps humain
 VITAL_IDS = {
     220045: 'HeartRate',
     220179: 'SystolicBP',
     220180: 'DiastolicBP',
-    220277: 'SpO2',        # Saturation Oxygène
-    220210: 'RespRate',    # Fréquence Respiratoire
+    220277: 'SpO2',        # Oxygen Saturation
+    220210: 'RespRate',    # Respiratory Rate
     223761: 'Temperature'  # Fahrenheit
 }
 
@@ -24,20 +22,19 @@ class MIMICPipeline:
         
     def load_cohort(self, n_patients=100):
         """
-        Charge un sous-ensemble de patients pour éviter de saturer la RAM.
+        Load a subset of patients to avoid saturating RAM.
         """
-        print(f"Chargement des données depuis {self.icu_path}...")
+        print(f"Loading data from {self.icu_path}...")
         
         if os.path.exists("./saves/cache_mimic.pkl"):
             print("Found already existing cache...")
             return pd.read_pickle("./saves/cache_mimic.pkl")
         
-        # 1. Lire les admissions pour avoir les IDs patients
-        # On prend juste les 100 premiers patients pour tester
+        # Read admissions to get patient IDs
         stays = pd.read_csv(os.path.join(self.icu_path, "icustays.csv"), nrows=n_patients)
         hadm_ids = stays['hadm_id'].unique()
         
-        print(f"Extraction des signes vitaux pour {len(hadm_ids)} séjours...")
+        print(f"Extracting vital signs for {len(hadm_ids)} stays...")
         
         start_time = time.time()
         
@@ -47,10 +44,10 @@ class MIMICPipeline:
         
         path_chart = os.path.join(self.icu_path, "chartevents.csv")
         
-        # Lecture optimisée : on ne garde que les colonnes et items utiles
+        # Optimized reading: keep only useful columns and items
         with pd.read_csv(path_chart, chunksize=chunksize, usecols=['subject_id', 'hadm_id', 'charttime', 'itemid', 'valuenum']) as reader:
             for chunk in reader:
-                # Filtrer pour nos patients et nos variables
+                # Filter for our patients and variables
                 filtered = chunk[
                     (chunk['hadm_id'].isin(hadm_ids)) & 
                     (chunk['itemid'].isin(VITAL_IDS.keys()))
@@ -58,29 +55,29 @@ class MIMICPipeline:
                 if not filtered.empty:
                     data_fragments.append(filtered)
                     
-                # Sécurité pour ne pas tout lire pendant le dev
+                # Avoid reading too much (crash RAM)
                 if len(data_fragments) > 50:
-                    print("Limite de fragments > 50, arrêt de la lecture.")
+                    print("Fragment limit > 50, stopping reading.")
                     break
         
         end_time = time.time()
         duration = end_time - start_time
-        print(f"\nExtraction terminée en {duration:.2f} secondes.")
+        print(f"\nExtraction completed in {duration:.2f} seconds.")
         
         if not data_fragments:
-            raise ValueError("Aucune donnée trouvée. Vérifiez les chemins.")
+            raise ValueError("No data found. Check the paths.")
             
         full_df = pd.concat(data_fragments)
         
-        # 3. Pivot : Transformer en format Time-Series
-        # Index: [Admission, Temps], Colonnes: [HR, BP, SpO2...]
+        # Pivot: Transform into Time-Series format
+        # Index: [Admission, Time], Columns: [HR, BP, SpO2...]
         full_df['charttime'] = pd.to_datetime(full_df['charttime'])
         full_df = full_df.sort_values('charttime')
         
-        # On renomme les IDs par des noms lisibles
+        # Rename IDs to readable names
         full_df['item_name'] = full_df['itemid'].map(VITAL_IDS)
         
-        # On arrondit à l'heure près pour aligner les mesures
+        # Round to the nearest hour to align measurements
         full_df['time_bucket'] = full_df['charttime'].dt.round('h')
         
         pivot_df = full_df.pivot_table(
@@ -97,8 +94,8 @@ class MIMICPipeline:
 class MIMICDataset(Dataset):
     def __init__(self, pivot_df, window_size=24, mask_ratio=0.2):
         """
-        mask_ratio: Pourcentage de données qu'on va cacher artificiellement
-        pour apprendre au modèle à les reconstruire (Imputation).
+        mask_ratio: Percentage of data that will be artificially hidden
+        to teach the model to reconstruct them (Imputation).
         """
         self.window_size = window_size
         self.mask_ratio = mask_ratio
@@ -115,7 +112,7 @@ class MIMICDataset(Dataset):
         print(f"After forward-backward fill, there is {normalized_df.isna().sum().sum()} NaN values. Filled it with 0.")
         normalized_df = normalized_df.fillna(0.0)
         
-        # Création des fenêtres glissantes
+        # Creation of sliding windows
         for hadm_id in pivot_df.index.get_level_values(0).unique():
             patient_data = normalized_df.xs(hadm_id).values
             
@@ -127,26 +124,26 @@ class MIMICDataset(Dataset):
                 self.samples.append(window)
                 
         self.data = np.array(self.samples, dtype=np.float32)
-        print(f"Dataset prêt : {self.data.shape} fenêtres de {window_size}h")
+        print(f"Dataset ready: {self.data.shape} windows of {window_size}h")
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        # x_clean est la vérité terrain
+        # x_clean is the ground truth
         x_clean = self.data[idx] 
         
-        # On crée un masque artificiel (Self-Supervised Learning)
-        # 1 = Donnée cachée, 0 = Donnée visible
+        # We create an artificial mask
+        # 1 = Hidden data, 0 = Visible data
         mask = np.random.binomial(1, self.mask_ratio, x_clean.shape).astype(np.float32)
         
-        # x_masked est l'entrée corrompue que le modèle doit réparer
-        # Si mask=1, on met la valeur à 0 (ou bruit)
+        # x_masked is the corrupted input that the model must repair
+        # If mask=1, we set the value to 0 (or noise)
         x_masked = x_clean * (1 - mask)
         
-        # Tensorisation
-        # Le modèle FSL attend une liste de tenseurs (un par asset/organe)
-        # Shape actuelle : (Time, Feats). Transpose -> (Feats, Time)
+        # Tensorization
+        # The FSL model expects a list of tensors (one per asset/organ)
+        # Current shape: (Time, Feats). Transpose -> (Feats, Time)
         x_masked_T = x_masked.T
         inputs = [torch.tensor(x_masked_T[i]) for i in range(x_masked_T.shape[0])]
         

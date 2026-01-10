@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import os
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau 
@@ -9,41 +10,39 @@ from fsl import MIMICPredictor
 
 def sharp_loss(pred, target, mask):
     """
-    Combine L1 (Valeur) et Diff (Pente) pour éviter les lignes plates.
+    Combines L1 (Value) and Diff (Slope) to avoid flat lines.
     """
-    # A. L1 Loss classique (Valeur Absolue)
-    # Punit l'erreur sans être trop sensible aux outliers (contrairement au carré)
+    # Classic L1 Loss (Absolute Value)
+    # Punishes error without being too sensitive to outliers (unlike squared)
     l1 = torch.abs(pred - target) * mask
     term_val = torch.sum(l1) / (torch.sum(mask) + 1e-8)
     
-    # B. Derivative Loss (Pénalité de Forme)
-    # On force la pente (t+1 - t) prédite à ressembler à la vraie pente
-    pred_diff = pred[:, 1:, :] - pred[:, :-1, :]       # Pente prédite
-    target_diff = target[:, 1:, :] - target[:, :-1, :] # Vraie pente
+    # Derivative Loss (Shape Penalty)
+    # Forces the predicted slope (t+1 - t) to resemble the true slope
+    pred_diff = pred[:, 1:, :] - pred[:, :-1, :]       # Predicted slope
+    target_diff = target[:, 1:, :] - target[:, :-1, :] # True slope
     
-    # On adapte le masque car on a perdu 1 point de temps avec la diff
+    # Adjust the mask because we lost 1 time point with the diff
     mask_diff = mask[:, 1:, :] * mask[:, :-1, :] 
     
     l1_diff = torch.abs(pred_diff - target_diff) * mask_diff
     term_shape = torch.sum(l1_diff) / (torch.sum(mask_diff) + 1e-8)
     
-    # On combine : 1.0 * Valeur + 1.0 * Forme
+    # We combine: 1.0 * Value + 1.0 * Shape
     return term_val + 1.0 * term_shape
 
 def train_mimic_reconstruction():
-    # --- CHARGEMENT DONNÉES ---
+    # Load data
     pipeline = MIMICPipeline()
     try:
-        # On charge les données (cache ou nouveau)
-        import os
         if os.path.exists("./saves/cache_mimic.pkl"):
             import pandas as pd
             df = pd.read_pickle("./saves/cache_mimic.pkl")
-            print("Cache chargé.")
+            print("Cache loaded.")
         else:
             df = pipeline.load_cohort(n_patients=200)
     except Exception as e:
-        print(f"Erreur data : {e}")
+        print(f"Data error: {e}")
         return
 
     # Dataset
@@ -57,17 +56,16 @@ def train_mimic_reconstruction():
     print(f"Initialisation du modèle pour {n_features} signes vitaux...")
     model = MIMICPredictor(n_assets=n_features, window_size=24).to(device)
     
-    # --- CONFIGURATION ENTRAÎNEMENT ---
-    EPOCHS = 30 # <--- AUGMENTÉ (pour laisser le temps au scheduler)
+    # Training configurations
+    n_epochs = 30
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
     
-    # NOUVEAU : Le Scheduler
-    # "Si la loss ne baisse pas pendant 3 époques, divise le LR par 2"
+    # Scheduler to reduce LR on plateau
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
     
-    print("Début de l'entraînement (L1 + Shape Loss + Scheduler)...")
+    print("Starting training...")
     
-    for epoch in range(EPOCHS):
+    for epoch in range(n_epochs):
         total_loss = 0
         total_h1 = 0
         
@@ -83,22 +81,22 @@ def train_mimic_reconstruction():
             # Forward
             _, res = model(inputs)
             
-            # --- CALCUL DE LA LOSS ---
+            # Loss computation :
             reconstructed_stack = torch.stack(res['outputs'], dim=2)
             
-            # 1. On utilise notre nouvelle fonction sharp_loss
+            # Use our new sharp_loss function
             reconstruction_loss = sharp_loss(reconstructed_stack, targets, mask)
             
-            # 2. On récupère le H1
+            # Retrieve the H1
             h1_loss = res['h1_score']
             
-            # 3. Total (On pondère le H1)
+            # Total (We weight the H1)
             loss = reconstruction_loss + 0.1 * h1_loss
             
             loss.backward()
             
-            # NOUVEAU : Clipping de Gradient
-            # Empêche le modèle de faire des bonds trop grands si la Loss explose
+            # Gradient Clipping
+            # Prevent the model from making too large jumps if the Loss explodes
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             
             optimizer.step()
@@ -107,20 +105,20 @@ def train_mimic_reconstruction():
             total_loss += reconstruction_loss.item()
             total_h1 += h1_loss.item() if isinstance(h1_loss, torch.Tensor) else h1_loss
             
-        # Moyennes de l'époque
+        # Averages for the epoch
         avg_loss = total_loss / len(loader)
         avg_h1 = total_h1 / len(loader)
         
-        print(f"Epoch {epoch+1}/{EPOCHS} | Loss (Sharp): {avg_loss:.4f} | H1: {avg_h1:.6f}")
+        print(f"Epoch {epoch+1}/{n_epochs} | Loss (Sharp): {avg_loss:.4f} | H1: {avg_h1:.6f}")
         
         scheduler.step(avg_loss)
         
         current_lr = optimizer.param_groups[0]['lr']
-        print(f"Current LR: {current_lr:.6f}") # On l'affiche nous-mêmes
+        print(f"Current LR: {current_lr:.6f}")
     
-    # Sauvegarde
+    # Save the model
     torch.save(model.state_dict(), "./saves/mimic_fsl.pth")
-    print("Modèle sauvegardé.")
+    print("Model saved.")
 
 if __name__ == "__main__":
     train_mimic_reconstruction()
