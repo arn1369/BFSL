@@ -1,319 +1,126 @@
-import yfinance as yf
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import pandas as pd
-import os
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau 
 
-from fsl import HierarchicalFSL, TopologicalTripletLoss
+from utils import MIMICPipeline, MIMICDataset
+from fsl import MIMICPredictor
 
-def get_universal_data():
+def sharp_loss(pred, target, mask):
     """
-    Downloads and cleans S&P 500 data.
-    Returns RAW RETURNS.
-    Global normalization is avoided here to prevent Look-Ahead Bias.
+    Combine L1 (Valeur) et Diff (Pente) pour éviter les lignes plates.
     """
+    # A. L1 Loss classique (Valeur Absolue)
+    # Punit l'erreur sans être trop sensible aux outliers (contrairement au carré)
+    l1 = torch.abs(pred - target) * mask
+    term_val = torch.sum(l1) / (torch.sum(mask) + 1e-8)
     
-    print("Downloading Universal Dataset...")
+    # B. Derivative Loss (Pénalité de Forme)
+    # On force la pente (t+1 - t) prédite à ressembler à la vraie pente
+    pred_diff = pred[:, 1:, :] - pred[:, :-1, :]       # Pente prédite
+    target_diff = target[:, 1:, :] - target[:, :-1, :] # Vraie pente
     
-    # Selection of diverse sectors (Tech, Finance, Energy, Health, etc.)
-    # to ensure the model learns universal market dynamics.
-    tickers = [
-        "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", 
-        "JPM", "BAC", 
-        "XOM", "CVX",
-        "JNJ", "PFE",
-        "PG", "KO", "MCD", "HD",
-        "DIS"
-    ]
+    # On adapte le masque car on a perdu 1 point de temps avec la diff
+    mask_diff = mask[:, 1:, :] * mask[:, :-1, :] 
     
-    data = yf.download(tickers, start="2010-01-01", end="2018-12-31", progress=True, auto_adjust=True)
+    l1_diff = torch.abs(pred_diff - target_diff) * mask_diff
+    term_shape = torch.sum(l1_diff) / (torch.sum(mask_diff) + 1e-8)
     
-    if isinstance(data.columns, pd.MultiIndex):
-        try:
-            if 'Close' in data.columns.get_level_values(0):
-                df = data['Close']
-            else:
-                df = data.xs('Close', axis=1, level=0)
-        except:
-            print("This isn't supposed to happen.")
-            df = data['Adj Close']
-    else:
-        df = data['Close'] if 'Close' in data.columns else data
+    # On combine : 1.0 * Valeur + 1.0 * Forme
+    return term_val + 1.0 * term_shape
 
-    # Cleaning Data
-    df = df.dropna(axis=1, thresh=int(len(df)*0.9)) # keep tickers with at least 90% data
-    df = df.ffill().bfill()
-    
-    returns = df.pct_change().dropna()
-    
-    print(f"Valid tickers retrieved: {len(returns.columns)}")
-    print(f"Data ready. Shape: {returns.shape}")
-    
-    return returns, returns.columns.tolist()
-
-class UniversalDataset(Dataset):
-    def __init__(self, dataframe, window_size=20, augment=False):
-        """
-        dataframe : DataFrame of RAW returns.
-        """
-        self.data = dataframe
-        self.window_size = window_size
-        self.augment = augment
-        self.n_assets = dataframe.shape[1]
-        self.values = dataframe.values 
-
-    def __len__(self):
-        return len(self.data) - self.window_size
-
-    def __getitem__(self, idx):
-        # Extraction : Get the window and the next value (target)
-        raw_window = self.values[idx : idx + self.window_size]
-        target = self.values[idx + self.window_size]
-        
-        # Instance Normalization: Normalize each window independently (Mean=0, Std=1)
-        # This is crucial for financial data to make it comparable across different volatility regimes.
-        window_mean = np.mean(raw_window, axis=0)
-        window_std = np.std(raw_window, axis=0) + 1e-8
-        normalized_window = (raw_window - window_mean) / window_std
-        
-        # Augmentation: Add noise during training
-        if self.augment:
-            noise = np.random.normal(0, 0.05, normalized_window.shape)
-            normalized_window = normalized_window + noise
-
-        # Tensorization
-        inputs = []
-        for asset_idx in range(self.n_assets):
-            asset_series = normalized_window[:, asset_idx]
-            
-            tensor = torch.tensor(asset_series, dtype=torch.float) 
-            
-            inputs.append(tensor)
-            
-        target_tensor = torch.tensor(target, dtype=torch.float)
-
-        return inputs, target_tensor
-
-class FSLPredictor(nn.Module):
-    """
-    Wraps the Hierarchical FSL backbone with a prediction head.
-    The FSL extracts features, and the head predicts the next return.
-    """
-    def __init__(self, n_assets, window_size):
-        super().__init__()
-        self.fsl = HierarchicalFSL(
-            scales=[16, 4, 1], # Hierarchical reduction
-            context_dim=window_size,
-            attention_dim=32,
-            diffusion_steps=[1, 2, 2]
-        )
-        # Simple linear head for forecasting
-        self.head = nn.Sequential(
-            nn.Linear(window_size, 32),
-            nn.GELU(),
-            nn.Linear(32, 1)
-        )
-        
-    def forward(self, x_list):
-        res = self.fsl(x_list)
-        clean_sections = res['sections']
-        
-        # Predict separately for each asset using the shared head
-        preds = []
-        for section in clean_sections:
-            preds.append(self.head(section))
-            
-        return torch.cat(preds, dim=1), res
-
-def correlation_loss(pred, target):
-    """
-    Maximizes Pearson correlation between prediction and target.
-    Encourages the model to get the relative ranking of assets right.
-    """
-    pred_n = (pred - pred.mean(dim=1, keepdim=True)) / (pred.std(dim=1, keepdim=True) + 1e-8)
-    target_n = (target - target.mean(dim=1, keepdim=True)) / (target.std(dim=1, keepdim=True) + 1e-8)
-    corr = (pred_n * target_n).mean(dim=1)
-    return 1 - corr.mean()
-
-def sign_loss(pred, target):
-    """
-    Penalizes directional errors.
-    Uses a soft differentiable approximation (tanh) to penalize wrong signs.
-    """
-    # Scale by 5.0 to make the tanh slope steeper around 0
-    pred_sign = torch.tanh(pred * 5.0)
-    target_sign = torch.sign(target)
-    
-    # We want pred_sign and target_sign to match (product close to 1)
-    return 1 - torch.mean(pred_sign * target_sign)
-
-def train_model():
-    # Load data
+def train_mimic_reconstruction():
+    # --- CHARGEMENT DONNÉES ---
+    pipeline = MIMICPipeline()
     try:
-        df_univ, tickers = get_universal_data()
-    except Exception as e:
-        print(f"Critical error during download: {e}")
-        return
-    
-    # Time-based split (Train: first 80%, Val: next 10%)
-    train_split = int(len(df_univ) * 0.8)
-    val_split = int(len(df_univ) * 0.9)
-    
-    train_df = df_univ.iloc[:train_split]
-    val_df = df_univ.iloc[train_split:val_split]
-    
-    print(f"Train: {len(train_df)} days, Val: {len(val_df)} days")
-    
-    # Initialize Datasets (augment only on training)
-    train_ds = UniversalDataset(train_df, augment=True)
-    val_ds = UniversalDataset(val_df, augment=False)
-    
-    if len(train_ds) == 0:
-        print("Error : Empty dataset.")
-        return
-
-    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=32, shuffle=False)
-    
-    # Setup Device and Model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training on {device}.")
-    
-    os.makedirs("./saves", exist_ok=True)
-    
-    model = FSLPredictor(n_assets=16, window_size=20).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-5)
-    
-    # Initialize Losses
-    triplet_criterion = TopologicalTripletLoss(margin=0.5, structural_weight=0.5).to(device)
-    mse_criterion = nn.MSELoss()
-    
-    # Early Stopping parameters
-    epochs = 20
-    patience = 4
-    best_val_loss = float('inf')
-    patience_counter = 0
-    
-    model.train()
-    
-    for epoch in range(epochs):
-        # TRAINING
-        total_loss = 0
-        batch_count = 0
-        
-        for inputs, targets in train_loader:
-            inputs = [x.to(device).float() for x in inputs]
-            targets = targets.to(device).float()
-            
-            # Anchor Pass (Clean Data)
-            optimizer.zero_grad()
-            preds_anchor, res_anchor = model(inputs)
-            
-            # Positive Pass (Slightly Noisy Data)
-            # We want the topology (H1 score) to remain stable despite noise
-            inputs_pos = [x + torch.randn_like(x) * 0.005 for x in inputs]
-            _, res_pos = model(inputs_pos)
-            
-            # Negative Pass (Incoherent/Shuffled Data)
-            # We want the topology to look very different (high H1) for shuffled data
-            batch_size = inputs[0].size(0)
-            inputs_neg = []
-            for x in inputs:
-                perm = torch.randperm(batch_size)
-                inputs_neg.append(x[perm])
-            
-            _, res_neg = model(inputs_neg)
-                        
-            #ANCHOR: LOSS COMPUTING
-            
-            # Prediction Accuracy (MSE)
-            mse = mse_criterion(preds_anchor, targets)
-            
-            
-            # Topological Triplet Loss
-            # Objectives: Low H1 for Anchor/Pos, High H1 for Neg, Anchor ≈ Pos
-            triplet_loss = triplet_criterion(
-                h1_anchor=res_anchor['h1_score'],
-                h1_positive=res_pos['h1_score'],
-                h1_negative=res_neg['h1_score']
-            )
-            
-            # Orthogonality & Reconstruction (Regularization)
-            recon_loss = 0
-            for original, reconstructed in zip(inputs, res_anchor['outputs']):
-                recon_loss += torch.mean((original - reconstructed) ** 2)
-
-            # Financial Metrics (Correlation & Sign)
-            corr = correlation_loss(preds_anchor, targets)
-            s_loss = sign_loss(preds_anchor, targets)
-            
-            # Total Loss combination
-            loss = 1.0 * corr + 0.5 * s_loss + 0.1 * mse + 0.5 * triplet_loss + 0.1 * recon_loss
-                    
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            
-            total_loss += loss.item()
-            batch_count += 1
-        
-        avg_train_loss = total_loss / batch_count
-        
-        
-        # VALIDATION
-        model.eval()
-        val_loss = 0
-        val_count = 0
-        
-        with torch.no_grad():
-            for inputs, targets in val_loader:
-                inputs = [x.to(device).float() for x in inputs]
-                targets = targets.to(device).float()
-                
-                preds, res = model(inputs)
-                
-                # Validation metric: simplified loss
-                mse = mse_criterion(preds, targets)
-                recon_loss = 0
-                for original, reconstructed in zip(inputs, res['outputs']):
-                    recon_loss += torch.mean((original - reconstructed) ** 2)
-                
-                loss = mse + 0.5 * recon_loss
-                val_loss += loss.item()
-                val_count += 1
-        
-        avg_val_loss = val_loss / val_count
-        
-        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
-        
-        #ANCHOR: Early stopping check
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            patience_counter = 0
-            torch.save(model.state_dict(), "./saves/fsl.pth")
-            print(f"New best model saved (val_loss: {best_val_loss:.6f})")
+        # On charge les données (cache ou nouveau)
+        import os
+        if os.path.exists("./saves/cache_mimic.pkl"):
+            import pandas as pd
+            df = pd.read_pickle("./saves/cache_mimic.pkl")
+            print("Cache chargé.")
         else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"\nEarly stopping triggered at epoch {epoch+1}")
-                break
+            df = pipeline.load_cohort(n_patients=200)
+    except Exception as e:
+        print(f"Erreur data : {e}")
+        return
+
+    # Dataset
+    dataset = MIMICDataset(df, window_size=24, mask_ratio=0.20)
+    loader = DataLoader(dataset, batch_size=32, shuffle=True)
+    
+    # Configuration
+    n_features = df.shape[1]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    print(f"Initialisation du modèle pour {n_features} signes vitaux...")
+    model = MIMICPredictor(n_assets=n_features, window_size=24).to(device)
+    
+    # --- CONFIGURATION ENTRAÎNEMENT ---
+    EPOCHS = 30 # <--- AUGMENTÉ (pour laisser le temps au scheduler)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    
+    # NOUVEAU : Le Scheduler
+    # "Si la loss ne baisse pas pendant 3 époques, divise le LR par 2"
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+    
+    print("Début de l'entraînement (L1 + Shape Loss + Scheduler)...")
+    
+    for epoch in range(EPOCHS):
+        total_loss = 0
+        total_h1 = 0
         
         model.train()
         
-    # Final save
-    print("\nLoading best model for final save...")
-    try:
-        model.load_state_dict(torch.load("./saves/fsl.pth"))
-    except FileNotFoundError:
-        print("Warning: Best model not found, saving current state.")
+        for inputs, targets, mask in loader:
+            inputs = [x.to(device) for x in inputs]
+            targets = targets.to(device)
+            mask = mask.to(device)
+            
+            optimizer.zero_grad()
+            
+            # Forward
+            _, res = model(inputs)
+            
+            # --- CALCUL DE LA LOSS ---
+            reconstructed_stack = torch.stack(res['outputs'], dim=2)
+            
+            # 1. On utilise notre nouvelle fonction sharp_loss
+            reconstruction_loss = sharp_loss(reconstructed_stack, targets, mask)
+            
+            # 2. On récupère le H1
+            h1_loss = res['h1_score']
+            
+            # 3. Total (On pondère le H1)
+            loss = reconstruction_loss + 0.1 * h1_loss
+            
+            loss.backward()
+            
+            # NOUVEAU : Clipping de Gradient
+            # Empêche le modèle de faire des bonds trop grands si la Loss explose
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
+            optimizer.step()
+            
+            # Logs
+            total_loss += reconstruction_loss.item()
+            total_h1 += h1_loss.item() if isinstance(h1_loss, torch.Tensor) else h1_loss
+            
+        # Moyennes de l'époque
+        avg_loss = total_loss / len(loader)
+        avg_h1 = total_h1 / len(loader)
+        
+        print(f"Epoch {epoch+1}/{EPOCHS} | Loss (Sharp): {avg_loss:.4f} | H1: {avg_h1:.6f}")
+        
+        scheduler.step(avg_loss)
+        
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Current LR: {current_lr:.6f}") # On l'affiche nous-mêmes
     
-    torch.save(model.state_dict(), "./saves/final_fsl.pth")
-    print("Done.")
+    # Sauvegarde
+    torch.save(model.state_dict(), "./saves/mimic_fsl.pth")
+    print("Modèle sauvegardé.")
 
 if __name__ == "__main__":
-    torch.manual_seed(1) # reproducibility
-    np.random.seed(1)
-    train_model()
+    train_mimic_reconstruction()

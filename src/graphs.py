@@ -1,69 +1,89 @@
-import os
+import torch
 import matplotlib.pyplot as plt
-import pandas as pd
 import numpy as np
-import pickle
+import pandas as pd
+from utils import MIMICPipeline, MIMICDataset, VITAL_IDS
+from fsl import MIMICPredictor
 
-def plot_performance(filename="./saves/backtest_results.pkl"):
-    print(f"Loading results from {filename}...")
+def visualize_reconstruction():
+    # 1. Setup
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pipeline = MIMICPipeline()
+    
+    # On charge le cache s'il existe (rapide)
     try:
-        with open(filename, "rb") as f:
-            data = pickle.load(f)
-    except FileNotFoundError:
-        print("Error: Please run test.py first to generate the results !")
+        import os
+        if os.path.exists("./saves/cache_mimic.pkl"):
+            df = pd.read_pickle("./saves/cache_mimic.pkl")
+        else:
+            df = pipeline.load_cohort(n_patients=100)
+    except:
+        # Fallback si pas de cache, on recharge
+        df = pipeline.load_cohort(n_patients=100)
+
+    # On prend un mask_ratio élevé (50%) pour vraiment tester le modèle !
+    dataset = MIMICDataset(df, window_size=24, mask_ratio=0.5) 
+    
+    # 2. Charger le modèle entraîné
+    n_features = 6
+    model = MIMICPredictor(n_assets=n_features, window_size=24).to(device)
+    try:
+        model.load_state_dict(torch.load("./saves/mimic_fsl.pth", map_location=device))
+        print("Modèle chargé avec succès.")
+    except Exception as e:
+        print(f"Error while loading the model : {e}")
         return
 
-    dates = data["dates"]
-    pnl_strategy = data["pnl_strategy"]
-    pnl_market = data["pnl_market"]
-    prob_calm_history = data["prob_calm"]
-    exposure_history = data["exposure"]
-    metrics = data["metrics"]
+    model.eval()
+
+    # 3. Prendre un exemple
+    # On cherche un exemple intéressant (pas juste une ligne plate)
+    idx = np.random.randint(0, len(dataset))
+    inputs, target_clean, mask = dataset[idx]
     
-    cum_strategy = np.cumsum(pnl_strategy)
-    cum_market = np.cumsum(pnl_market)
+    # Préparer pour le modèle
+    inputs_dev = [x.unsqueeze(0).to(device) for x in inputs] # Add batch dim
     
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 12), sharex=True, 
-                                          gridspec_kw={'height_ratios': [3, 1, 1]})
+    with torch.no_grad():
+        _, res = model(inputs_dev)
+        reconstructed = torch.stack(res['outputs'], dim=2).squeeze(0).cpu().numpy() # (Time, Feats)
     
-    # 1: P&L
-    ax1.plot(dates, cum_strategy, label='FSL + MultiHMM V3', linewidth=2, color='teal')
-    ax1.plot(dates, cum_market, label='Market Benchmark', linestyle='--', color='#1f77b4')
+    target_clean = target_clean.numpy()
+    mask = mask.numpy()
     
-    title = f"Strategy: FSL + HMM (Reconstructed Results)\n"
-    title += f"Sharpe: {metrics['sharpe']:.2f} | Calmar: {metrics['calmar']:.2f} | Max DD: {metrics['max_dd']:.1f}%"
+    # L'entrée masquée (ce que le modèle a vu)
+    input_visible = target_clean.copy()
+    input_visible[mask == 1] = np.nan # On met NaN là où c'était caché pour ne pas l'afficher
+
+    # 4. Plotting
+    features = list(VITAL_IDS.values())
+    fig, axes = plt.subplots(n_features, 1, figsize=(10, 15), sharex=True)
     
-    ax1.set_title(title)
-    ax1.set_ylabel("Cumulative PnL")
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+    time_axis = np.arange(24)
     
-    # 2: HMM Probabilities
-    ax2.plot(dates, prob_calm_history, label='P(Normal+Bull)', color='green', linewidth=1.5)
-    ax2.fill_between(dates, 0, prob_calm_history, color='green', alpha=0.15)
-    ax2.axhline(0.5, color='gray', linestyle='--', alpha=0.5, linewidth=0.8)
-    ax2.set_ylabel("P(Favorable)")
-    ax2.set_ylim(-0.05, 1.05)
-    ax2.legend(loc='upper right')
-    ax2.grid(True, alpha=0.2)
-    
-    # 3 : Dynamic exposure
-    ax3.plot(dates, exposure_history, label='Dynamic Exposure', color='orange', linewidth=1.5)
-    ax3.fill_between(dates, 0, exposure_history, color='orange', alpha=0.15)
-    ax3.axhline(0.75, color='gray', linestyle='--', alpha=0.5, linewidth=0.8, label='Target 75%')
-    ax3.set_ylabel("Exposure")
-    ax3.set_xlabel("Date")
-    ax3.set_ylim(-0.05, 1.25)
-    ax3.legend(loc='upper right')
-    ax3.grid(True, alpha=0.2)
-    
+    for i in range(n_features):
+        ax = axes[i]
+        feature_name = features[i] if i < len(features) else f"Feat {i}"
+        
+        # Vraie donnée (Ligne verte continue)
+        ax.plot(time_axis, target_clean[:, i], color='green', label='Vérité Terrain', linewidth=2, alpha=0.5)
+        
+        # Donnée reconstruite (Ligne rouge pointillée)
+        ax.plot(time_axis, reconstructed[:, i], color='red', linestyle='--', label='Reconstruction FSL')
+        
+        # Ce que le modèle a vu (Points bleus)
+        # S'il y a un trou dans les points bleus, le modèle a dû inventer la ligne rouge !
+        ax.scatter(time_axis, input_visible[:, i], color='blue', s=20, label='Entrée Visible', zorder=5)
+        
+        ax.set_ylabel(feature_name)
+        if i == 0:
+            ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+
+    plt.suptitle(f"Reconstruction FSL (MIMIC-IV) - H1 Score: {res['h1_score'].item():.4f}")
+    plt.xlabel("Heures")
     plt.tight_layout()
-    
-    os.makedirs("visuals", exist_ok=True)
-    
-    plt.savefig("visuals/perf.png", dpi=150, bbox_inches='tight')
-    print("Saved to visuals/perf.png.")
-    print("Done.")
+    plt.savefig("./visuals/reconstruction.png")
 
 if __name__ == "__main__":
-    plot_performance()
+    visualize_reconstruction()

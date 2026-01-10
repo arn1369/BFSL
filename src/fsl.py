@@ -302,15 +302,8 @@ class HierarchicalFSL(nn.Module):
         inputs: List of tensors corresponding to the finest scale.
         """
         
-        # --- Gating Mechanism ---
-        # Detects high volatility/magnitude. If data is too volatile,
-        # we reduce diffusion to prevent over-smoothing.
-        stacked_inputs = torch.stack(inputs)
-        avg_magnitude = torch.mean(torch.abs(stacked_inputs))
-        
+        # Always diffuse information
         diffusion_scale = 1.0
-        if avg_magnitude > 0.9: 
-            diffusion_scale = 0.1 # Reduce diffusion by 90%
         
         # Initial Encoding
         sections_fine = [enc(x) for enc, x in zip(self.encoders, inputs)]
@@ -362,8 +355,7 @@ class HierarchicalFSL(nn.Module):
             'pyramid': pyramid,
             'adjacency_pyramid': adjacency_pyramid,
             'h1_score': h1_loss,
-            'ortho_loss': ortho_loss,
-            'diffusion_scale': diffusion_scale
+            'ortho_loss': ortho_loss
         }
     
     def compute_h1_multiscale(self, pyramid: List[List[torch.Tensor]], 
@@ -374,7 +366,7 @@ class HierarchicalFSL(nn.Module):
         Higher weights are assigned to coarser scales (global structures).
         """
         total_h1 = 0.0
-        scale_weights = [1.0, 1.5, 2.0] #NOTE: this is bad
+        scale_weights = [1.0, 1.5, 2.0]
         
         for scale_idx, (sections, adj) in enumerate(zip(pyramid[1:], adjacency_pyramid)):
             sheaf = self.sheaves[scale_idx + 1]
@@ -476,3 +468,26 @@ class TopologicalTripletLoss(nn.Module):
             embedding_loss = F.mse_loss(anchor_embedding, positive_embedding)
             
         return self.structural_weight * structural_loss + triplet_loss + 0.1 * embedding_loss
+
+class MIMICPredictor(nn.Module):
+    def __init__(self, n_assets, window_size):
+        super().__init__()
+        
+        #ANCHOR: Simple hierarchy -> probably need to change !!
+        self.fsl = HierarchicalFSL(
+            scales=[n_assets, n_assets//2, 1], 
+            context_dim=window_size,
+            attention_dim=32,
+            diffusion_steps=[1, 2, 2] # Diffusion au niveau organes, puis au niveau global
+        )
+        
+        # Tête de prédiction (optionnelle pour la reconstruction mais requise par le code)
+        self.head = nn.Sequential(
+            nn.Linear(window_size, 32),
+            nn.GELU(),
+            nn.Linear(32, 1)
+        )
+        
+    def forward(self, x_list):
+        res = self.fsl(x_list)
+        return getattr(res, 'outputs', res['outputs']), res
