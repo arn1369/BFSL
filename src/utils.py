@@ -92,7 +92,7 @@ class MIMICPipeline:
         return pivot_df
 
 class MIMICDataset(Dataset):
-    def __init__(self, pivot_df, window_size=24, mask_ratio=0.2):
+    def __init__(self, pivot_df, window_size=24, mask_ratio=0.2, stats=None):
         """
         mask_ratio: Percentage of data that will be artificially hidden
         to teach the model to reconstruct them (Imputation).
@@ -102,19 +102,25 @@ class MIMICDataset(Dataset):
         self.samples = []
         
         # Normalization
-        scaler_mean = pivot_df.mean()
-        scaler_std = pivot_df.std()
-        normalized_df = (pivot_df - scaler_mean) / (scaler_std + 1e-6)
+        if stats is None:
+            self.scaler_mean = pivot_df.mean()
+            self.scaler_std = pivot_df.std()
+        else:
+            self.scaler_mean, self.scaler_std = stats
+        
+        normalized_df = (pivot_df - self.scaler_mean) / (self.scaler_std + 1e-6)
         
         # Forward fill for NaNs
-        normalized_df = normalized_df.groupby('hadm_id').ffill() # forward fill
-        normalized_df = normalized_df.groupby('hadm_id').bfill() # backward fill
-        print(f"After forward-backward fill, there is {normalized_df.isna().sum().sum()} NaN values. Filled it with 0.")
+        normalized_df = normalized_df.groupby('hadm_id').ffill()
+        print(f"After forward fill, there is {normalized_df.isna().sum().sum()} NaN values. Filled it with 0.")
         normalized_df = normalized_df.fillna(0.0)
         
         # Creation of sliding windows
         for hadm_id in pivot_df.index.get_level_values(0).unique():
-            patient_data = normalized_df.xs(hadm_id).values
+            try: # avoid create sliding windows on two patients
+                patient_data = normalized_df.xs(hadm_id).values
+            except KeyError:
+                continue
             
             if len(patient_data) < window_size:
                 continue
@@ -148,3 +154,9 @@ class MIMICDataset(Dataset):
         inputs = [torch.tensor(x_masked_T[i]) for i in range(x_masked_T.shape[0])]
         
         return inputs, torch.tensor(x_clean), torch.tensor(mask)
+    
+    def get_stats(self):
+        """
+        Return mean and std to normalize new data
+        """
+        return self.scaler_mean, self.scaler_std

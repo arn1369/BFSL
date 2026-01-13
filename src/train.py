@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import os
@@ -7,29 +8,33 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from utils import MIMICPipeline, MIMICDataset
 from fsl import MIMICPredictor
+import torch.nn.functional as F
 
-def sharp_loss(pred, target, mask):
+def mimic_loss(pred, target, mask):
     """
-    Combines L1 (Value) and Diff (Slope) to avoid flat lines.
+    Composite Loss to avoid collapse to the mean.
     """
-    # Classic L1 Loss (Absolute Value)
-    # Punishes error without being too sensitive to outliers (unlike squared)
-    l1 = torch.abs(pred - target) * mask
-    term_val = torch.sum(l1) / (torch.sum(mask) + 1e-8)
+    # Reconstruction (L1) only on masked parts
+    l1_loss = F.l1_loss(pred * mask, target * mask, reduction='sum') / (torch.sum(mask) + 1e-8) # for numerical stability
     
-    # Derivative Loss (Shape Penalty)
-    # Forces the predicted slope (t+1 - t) to resemble the true slope
-    pred_diff = pred[:, 1:, :] - pred[:, :-1, :]       # Predicted slope
-    target_diff = target[:, 1:, :] - target[:, :-1, :] # True slope
+    # Shape - gradient loss
+    pred_diff = pred[:, 1:, :] - pred[:, :-1, :]
+    target_diff = target[:, 1:, :] - target[:, :-1, :]
+    mask_diff = mask[:, 1:, :] * mask[:, :-1, :]
     
-    # Adjust the mask because we lost 1 time point with the diff
-    mask_diff = mask[:, 1:, :] * mask[:, :-1, :] 
+    shape_loss = F.l1_loss(pred_diff * mask_diff, target_diff * mask_diff, reduction='sum') / (torch.sum(mask_diff) + 1e-8)
     
-    l1_diff = torch.abs(pred_diff - target_diff) * mask_diff
-    term_shape = torch.sum(l1_diff) / (torch.sum(mask_diff) + 1e-8)
+    # Variance Loss
+    # Forces the model to produce structured "noise" rather than a flat line.
+    # We calculate the standard deviation along the temporal axis (dim=1)
+    std_pred = torch.std(pred, dim=1)
+    std_target = torch.std(target, dim=1)
     
-    # We combine: 1.0 * Value + 1.0 * Shape
-    return term_val + 1.0 * term_shape
+    # We want the predicted variance to be close to the true variance
+    var_loss = F.mse_loss(std_pred, std_target)
+    
+    # Weighting
+    return l1_loss + 1.5 * shape_loss + 0.3 * var_loss
 
 def train_mimic_reconstruction():
     # Load data
@@ -44,21 +49,42 @@ def train_mimic_reconstruction():
     except Exception as e:
         print(f"Data error: {e}")
         return
+    
+    # Split train/val on patients
+    all_patients = df.index.get_level_values('hadm_id').unique().to_numpy()
+    np.random.shuffle(all_patients)
+    
+    split_idx = int(len(all_patients) * 0.8)
+    train_ids = all_patients[:split_idx]
+    val_ids = all_patients[split_idx:]
+    
+    print(f"Split Patients: {len(train_ids)} Train / {len(val_ids)} Val")
+    
+    # MultiIndex slicing
+    df_train = df[df.index.get_level_values('hadm_id').isin(train_ids)]
+    df_val = df[df.index.get_level_values('hadm_id').isin(val_ids)]
+    
+    # Dataset creation
+    train_dataset = MIMICDataset(df_train, window_size=24, mask_ratio=0.30) # change to 30% mask ratio (from #Alpha 1.0.1 : 50%)
+    train_stats = train_dataset.get_stats()
 
-    # Dataset
-    dataset = MIMICDataset(df, window_size=24, mask_ratio=0.20)
-    loader = DataLoader(dataset, batch_size=32, shuffle=True)
+    val_dataset = MIMICDataset(df_val, window_size=24, mask_ratio=0.30, stats=train_stats)
+    
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+    
     
     # Configuration
     n_features = df.shape[1]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    print(f"Initialisation du modèle pour {n_features} signes vitaux...")
+    print(f"Model initialization for {n_features} vital signs...")
+    
     model = MIMICPredictor(n_assets=n_features, window_size=24).to(device)
     
     # Training configurations
     n_epochs = 30
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4) # try AdamW instead of Adam
     
     # Scheduler to reduce LR on plateau
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
@@ -66,55 +92,53 @@ def train_mimic_reconstruction():
     print("Starting training...")
     
     for epoch in range(n_epochs):
-        total_loss = 0
-        total_h1 = 0
-        
         model.train()
+        total_loss = 0
         
-        for inputs, targets, mask in loader:
+        # Training Loop
+        for inputs, targets, mask in train_loader:
             inputs = [x.to(device) for x in inputs]
             targets = targets.to(device)
             mask = mask.to(device)
             
             optimizer.zero_grad()
             
-            # Forward
             _, res = model(inputs)
+            reconstructed = torch.stack(res['outputs'], dim=2)
             
-            # Loss computation :
-            reconstructed_stack = torch.stack(res['outputs'], dim=2)
+            # Mimic Loss (check details in the function)
+            loss = mimic_loss(reconstructed, targets, mask)
             
-            # Use our new sharp_loss function
-            reconstruction_loss = sharp_loss(reconstructed_stack, targets, mask)
-            
-            # Retrieve the H1
+            # Adding H¹ with small weight at the start (avoiding collapse)
             h1_loss = res['h1_score']
+            total_objective = loss + 0.05 * h1_loss
             
-            # Total (We weight the H1)
-            loss = reconstruction_loss + 0.1 * h1_loss
-            
-            loss.backward()
-            
-            # Gradient Clipping
-            # Prevent the model from making too large jumps if the Loss explodes
+            total_objective.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            
             optimizer.step()
             
-            # Logs
-            total_loss += reconstruction_loss.item()
-            total_h1 += h1_loss.item() if isinstance(h1_loss, torch.Tensor) else h1_loss
+            total_loss += loss.item()
             
-        # Averages for the epoch
-        avg_loss = total_loss / len(loader)
-        avg_h1 = total_h1 / len(loader)
+        avg_train_loss = total_loss / len(train_loader)
         
-        print(f"Epoch {epoch+1}/{n_epochs} | Loss (Sharp): {avg_loss:.4f} | H1: {avg_h1:.6f}")
+        # Validation Loop 
+        model.eval()
+        val_loss_acc = 0
+        with torch.no_grad():
+            for inputs, targets, mask in val_loader:
+                inputs = [x.to(device) for x in inputs]
+                targets = targets.to(device)
+                mask = mask.to(device)
+                
+                _, res = model(inputs)
+                reconstructed = torch.stack(res['outputs'], dim=2)
+                val_loss_acc += mimic_loss(reconstructed, targets, mask).item()
         
-        scheduler.step(avg_loss)
+        avg_val_loss = val_loss_acc / len(val_loader)
         
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"Current LR: {current_lr:.6f}")
+        print(f"Epoch {epoch+1}/{n_epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+        
+        scheduler.step(avg_val_loss)
     
     # Save the model
     torch.save(model.state_dict(), "./saves/mimic_fsl.pth")

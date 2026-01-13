@@ -33,17 +33,17 @@ Here we apply FSL to the health sector. For now, we use the MIMIC IV database. F
 ## Phase 1
 
     At the end of Phase 1 (implementing the basic model and signal reconstruction), we get some interesting results :
-        - MSE of ~0.36 (normalized)
-        - MAE of ~0.40 (normalized)
+        - MSE of 0.3912 (normalized)
+        - MAE of 0.4348 (normalized)
 
     Here is an approximation of the precision per vital sign :
 
-        HeartRate       : Mean error 7.03 bpm (Norm: 0.352)
-        SystolicBP      : Mean error 7.96 mmHg (Norm: 0.319)
-        DiastolicBP     : Mean error 7.65 mmHg (Norm: 0.510)
-        SpO2            : Mean error 1.69 % (Norm: 0.564)
-        RespRate        : Mean error 1.87 bpm (Norm: 0.373)
-        Temperature     : Mean error 0.51 °F (Norm: 0.339)
+        HeartRate       : Mean error 7.76 bpm (Norm: 0.388)
+        SystolicBP      : Mean error 8.45 mmHg (Norm: 0.338)
+        DiastolicBP     : Mean error 7.73 mmHg (Norm: 0.516)
+        SpO2            : Mean error 1.76 % (Norm: 0.585)
+        RespRate        : Mean error 2.13 bpm (Norm: 0.426)
+        Temperature     : Mean error 0.54 °F (Norm: 0.358) 
 
     These are nice results. We have to consider that measurements are not perfect too. I need to check what is the standard error on measurements sensors to see what is nice or not, and what is biased (if the model has better prediction than the measurement error, there is a problem).
 
@@ -71,9 +71,15 @@ Here we apply FSL to the health sector. For now, we use the MIMIC IV database. F
 ### Future Phase 1 versions
 
     \#Alpha 0.0.2 : 
-        - Change the bfill, maybe with more ffill pass
+        - Change the bfill
         - split/train by seperating patients ID.
         - reduce loss weight of diffusion
+        * Implementation comments :
+            -> model find high link between DiastolicBP and SpO2 -> wtf ?
+            -> Problems of over-smoothing (scatter_pred)
+
+    \#Alpha 0.0.3 :
+        - Fix over-smoothing (probabilistic output -> normal distrib ?) other methods ?
 
 ## Phase 2
 
