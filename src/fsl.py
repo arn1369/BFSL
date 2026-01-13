@@ -422,7 +422,7 @@ class TopologicalContrastiveLoss(nn.Module):
         self.margin = margin
     
     def forward(self, h1_coherent: torch.Tensor, h1_incoherent: torch.Tensor) -> torch.Tensor:
-       # Coherent data should have low H1, Incoherent data should have high H1
+        # Coherent data should have low H1, Incoherent data should have high H1
         loss_coherent = h1_coherent
         loss_incoherent = F.relu(self.margin - h1_incoherent)
         

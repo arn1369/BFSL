@@ -98,9 +98,6 @@ def plot_adjacency(model, dataset, device):
 def plot_scatter_performance(model, dataset, device):
     """
     Compares Ground Truth vs. Prediction on masked data only.
-    Diagnostic:
-    - Diagonal (y=x) -> Good performance.
-    - Horizontal line -> Model collapse (predicting mean).
     """
     print("Generating Scatter Plot...")
     model.eval()

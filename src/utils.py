@@ -142,7 +142,7 @@ class MIMICDataset(Dataset):
         # We create an artificial mask
         # 1 = Hidden data, 0 = Visible data
         mask = np.random.binomial(1, self.mask_ratio, x_clean.shape).astype(np.float32)
-        
+         
         # x_masked is the corrupted input that the model must repair
         # If mask=1, we set the value to 0 (or noise)
         x_masked = x_clean * (1 - mask)
