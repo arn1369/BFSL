@@ -1,29 +1,9 @@
-name: Test Fedora Server
+name: CI Arnika Labs
 on: [push]
-
 jobs:
-  test-prod:
-    # C'est ICI que la magie opère : on cible ton serveur, pas le cloud
+  build:
     runs-on: self-hosted
-    
     steps:
-      - name: Checkout du code
-        uses: actions/checkout@v4
-
-      - name: Vérifier l'hôte
-        run: |
-          echo "Je tourne sur : $(hostname)"
-          echo "OS : $(cat /etc/fedora-release)"
-          echo "Kernel : $(uname -r)"
-
-      - name: Installation de uv (si absent)
-        run: |
-          if ! command -v uv &> /dev/null; then
-              curl -LsSf https://astral.sh/uv/install.sh | sh
-          fi
-
-      - name: Créer un venv et tester Python
-        run: |
-          # uv est ultra rapide
-          uv venv
-          uv run python3 -c "import sys; print(f'Succès ! Python {sys.version} tourne sur le serveur.')"
+      - uses: actions/checkout@v4
+      - name: Check Context
+        run: echo "Ce job tourne sur le runner partagé de Arnika Labs !"
